@@ -1,0 +1,5 @@
+node_modules/
+dist/
+# Base de données et clé secrète locales (ne jamais les publier)
+server/data/
+.DS_Store
