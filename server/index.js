@@ -85,22 +85,22 @@ function checkRateLimit(key) {
   if (entry.count > 10) throw new HttpError(429, "Trop de tentatives. Réessayez dans quelques minutes.");
 }
 
-function currentUser(req) {
+async function currentUser(req) {
   const header = req.headers.authorization || "";
   const userId = readToken(header.startsWith("Bearer ") ? header.slice(7) : "");
-  const user = userId && db.prepare("SELECT * FROM users WHERE id = ?").get(userId);
+  const user = userId && (await db.get("SELECT * FROM users WHERE id = ?", userId));
   if (!user) throw new HttpError(401, "Veuillez vous connecter.");
   return user;
 }
 
 // Toutes les données d'un utilisateur, renvoyées en une seule fois après la connexion.
-function userBundle(user) {
-  const saved = db.prepare("SELECT data FROM saved_places WHERE user_id = ? ORDER BY created_at DESC, id DESC").all(user.id)
+async function userBundle(user) {
+  const saved = (await db.all("SELECT data FROM saved_places WHERE user_id = ? ORDER BY created_at DESC, id DESC", user.id))
     .map((row) => JSON.parse(row.data));
   const countries = Object.fromEntries(
-    db.prepare("SELECT country_code, status FROM country_status WHERE user_id = ?").all(user.id).map((r) => [r.country_code, r.status]),
+    (await db.all("SELECT country_code, status FROM country_status WHERE user_id = ?", user.id)).map((r) => [r.country_code, r.status]),
   );
-  const trips = db.prepare("SELECT * FROM trips WHERE user_id = ? ORDER BY COALESCE(start_date, '9999'), id DESC").all(user.id).map(publicTrip);
+  const trips = (await db.all("SELECT * FROM trips WHERE user_id = ? ORDER BY COALESCE(start_date, '9999'), id DESC", user.id)).map(publicTrip);
   return { user: publicUser(user), saved, countries, trips };
 }
 
@@ -120,106 +120,108 @@ route("POST", "/api/auth/register", async (req) => {
   if (name.length < 2) throw new HttpError(400, "Votre nom doit contenir au moins 2 caractères.");
   if (!isEmail(email)) throw new HttpError(400, "Adresse email invalide.");
   if (password.length < 8 || password.length > 200) throw new HttpError(400, "Le mot de passe doit contenir au moins 8 caractères.");
-  if (db.prepare("SELECT 1 FROM users WHERE email = ?").get(email)) throw new HttpError(409, "Un compte existe déjà avec cet email.");
-  const { lastInsertRowid } = db.prepare("INSERT INTO users (name, email, password_hash) VALUES (?, ?, ?)").run(name, email, hashPassword(password));
-  const user = db.prepare("SELECT * FROM users WHERE id = ?").get(lastInsertRowid);
-  return [201, { token: createToken(user.id), ...userBundle(user) }];
+  if ((await db.get("SELECT 1 FROM users WHERE email = ?", email))) throw new HttpError(409, "Un compte existe déjà avec cet email.");
+  const { lastInsertRowid } = (await db.run("INSERT INTO users (name, email, password_hash) VALUES (?, ?, ?)", name, email, hashPassword(password)));
+  const user = (await db.get("SELECT * FROM users WHERE id = ?", lastInsertRowid));
+  return [201, { token: createToken(user.id), ...(await userBundle(user)) }];
 });
 
 route("POST", "/api/auth/login", async (req) => {
   const body = await readJson(req);
   const email = text(body.email, 160).toLowerCase();
   checkRateLimit(`${req.socket.remoteAddress}|${email}`);
-  const user = db.prepare("SELECT * FROM users WHERE email = ?").get(email);
+  const user = (await db.get("SELECT * FROM users WHERE email = ?", email));
   if (!user || !verifyPassword(String(body.password || ""), user.password_hash)) {
     throw new HttpError(401, "Email ou mot de passe incorrect.");
   }
-  return { token: createToken(user.id), ...userBundle(user) };
+  return { token: createToken(user.id), ...(await userBundle(user)) };
 });
 
-route("GET", "/api/me", (req) => userBundle(currentUser(req)));
+route("GET", "/api/me", async (req) => userBundle(await currentUser(req)));
 
 route("PUT", "/api/me", async (req) => {
-  const user = currentUser(req);
+  const user = await currentUser(req);
   const body = await readJson(req);
   const name = text(body.name, 80);
   const homeCountry = text(body.homeCountry, 2).toUpperCase() || null;
   if (name.length < 2) throw new HttpError(400, "Votre nom doit contenir au moins 2 caractères.");
   if (homeCountry && !isCountryCode(homeCountry)) throw new HttpError(400, "Code pays invalide.");
-  db.prepare("UPDATE users SET name = ?, bio = ?, home_country = ? WHERE id = ?").run(name, text(body.bio, 500), homeCountry, user.id);
-  return { user: publicUser(db.prepare("SELECT * FROM users WHERE id = ?").get(user.id)) };
+  (await db.run("UPDATE users SET name = ?, bio = ?, home_country = ? WHERE id = ?", name, text(body.bio, 500), homeCountry, user.id));
+  return { user: publicUser((await db.get("SELECT * FROM users WHERE id = ?", user.id))) };
 });
 
 route("PUT", "/api/me/password", async (req) => {
-  const user = currentUser(req);
+  const user = await currentUser(req);
   const body = await readJson(req);
   if (!verifyPassword(String(body.current || ""), user.password_hash)) throw new HttpError(400, "Mot de passe actuel incorrect.");
   const next = typeof body.next === "string" ? body.next : "";
   if (next.length < 8 || next.length > 200) throw new HttpError(400, "Le nouveau mot de passe doit contenir au moins 8 caractères.");
-  db.prepare("UPDATE users SET password_hash = ? WHERE id = ?").run(hashPassword(next), user.id);
+  (await db.run("UPDATE users SET password_hash = ? WHERE id = ?", hashPassword(next), user.id));
   return { ok: true };
 });
 
 route("DELETE", "/api/me", async (req) => {
-  const user = currentUser(req);
+  const user = await currentUser(req);
   const body = await readJson(req);
   if (!verifyPassword(String(body.password || ""), user.password_hash)) throw new HttpError(400, "Mot de passe incorrect.");
-  db.prepare("DELETE FROM users WHERE id = ?").run(user.id); // les favoris, pays et voyages partent avec (ON DELETE CASCADE)
+  // On efface d'abord les données liées, puis le compte.
+  for (const table of ["saved_places", "country_status", "trips"]) await db.run(`DELETE FROM ${table} WHERE user_id = ?`, user.id);
+  await db.run("DELETE FROM users WHERE id = ?", user.id);
   return [204];
 });
 
 route("POST", "/api/saved", async (req) => {
-  const user = currentUser(req);
+  const user = await currentUser(req);
   const place = cleanPlace((await readJson(req)).place);
-  db.prepare("INSERT INTO saved_places (user_id, place_id, data) VALUES (?, ?, ?) ON CONFLICT (user_id, place_id) DO UPDATE SET data = excluded.data")
-    .run(user.id, place.id, JSON.stringify(place));
+  (await db.run("INSERT INTO saved_places (user_id, place_id, data) VALUES (?, ?, ?) ON CONFLICT (user_id, place_id) DO UPDATE SET data = excluded.data", user.id, place.id, JSON.stringify(place)));
   return [201, { place }];
 });
 
-route("DELETE", "/api/saved/(?<placeId>[^/]+)", (req, params) => {
-  const user = currentUser(req);
-  db.prepare("DELETE FROM saved_places WHERE user_id = ? AND place_id = ?").run(user.id, decodeURIComponent(params.placeId));
+route("DELETE", "/api/saved/(?<placeId>[^/]+)", async (req, params) => {
+  const user = await currentUser(req);
+  (await db.run("DELETE FROM saved_places WHERE user_id = ? AND place_id = ?", user.id, decodeURIComponent(params.placeId)));
   return [204];
 });
 
 route("PUT", "/api/countries/(?<code>[A-Za-z]{2})", async (req, params) => {
-  const user = currentUser(req);
+  const user = await currentUser(req);
   const { status } = await readJson(req);
   if (status !== "visited" && status !== "wishlist") throw new HttpError(400, "Statut invalide.");
-  db.prepare(`INSERT INTO country_status (user_id, country_code, status) VALUES (?, ?, ?)
-              ON CONFLICT (user_id, country_code) DO UPDATE SET status = excluded.status, updated_at = datetime('now')`)
-    .run(user.id, params.code.toUpperCase(), status);
+  (await db.run(`INSERT INTO country_status (user_id, country_code, status) VALUES (?, ?, ?)
+              ON CONFLICT (user_id, country_code) DO UPDATE SET status = excluded.status, updated_at = datetime('now')`, user.id, params.code.toUpperCase(), status));
   return { code: params.code.toUpperCase(), status };
 });
 
-route("DELETE", "/api/countries/(?<code>[A-Za-z]{2})", (req, params) => {
-  const user = currentUser(req);
-  db.prepare("DELETE FROM country_status WHERE user_id = ? AND country_code = ?").run(user.id, params.code.toUpperCase());
+route("DELETE", "/api/countries/(?<code>[A-Za-z]{2})", async (req, params) => {
+  const user = await currentUser(req);
+  (await db.run("DELETE FROM country_status WHERE user_id = ? AND country_code = ?", user.id, params.code.toUpperCase()));
   return [204];
 });
 
 route("POST", "/api/trips", async (req) => {
-  const user = currentUser(req);
+  const user = await currentUser(req);
   const t = cleanTrip(await readJson(req));
-  const { lastInsertRowid } = db.prepare(
+  const { lastInsertRowid } = await db.run(
     "INSERT INTO trips (user_id, name, country_code, start_date, end_date, notes, stops) VALUES (?, ?, ?, ?, ?, ?, ?)",
-  ).run(user.id, t.name, t.countryCode, t.startDate || null, t.endDate || null, t.notes, JSON.stringify(t.stops));
-  return [201, { trip: publicTrip(db.prepare("SELECT * FROM trips WHERE id = ?").get(lastInsertRowid)) }];
+    user.id, t.name, t.countryCode, t.startDate || null, t.endDate || null, t.notes, JSON.stringify(t.stops),
+  );
+  return [201, { trip: publicTrip((await db.get("SELECT * FROM trips WHERE id = ?", lastInsertRowid))) }];
 });
 
 route("PUT", "/api/trips/(?<id>\\d+)", async (req, params) => {
-  const user = currentUser(req);
+  const user = await currentUser(req);
   const t = cleanTrip(await readJson(req));
-  const result = db.prepare(
+  const result = await db.run(
     "UPDATE trips SET name = ?, country_code = ?, start_date = ?, end_date = ?, notes = ?, stops = ? WHERE id = ? AND user_id = ?",
-  ).run(t.name, t.countryCode, t.startDate || null, t.endDate || null, t.notes, JSON.stringify(t.stops), Number(params.id), user.id);
+    t.name, t.countryCode, t.startDate || null, t.endDate || null, t.notes, JSON.stringify(t.stops), Number(params.id), user.id,
+  );
   if (!result.changes) throw new HttpError(404, "Voyage introuvable.");
-  return { trip: publicTrip(db.prepare("SELECT * FROM trips WHERE id = ?").get(Number(params.id))) };
+  return { trip: publicTrip((await db.get("SELECT * FROM trips WHERE id = ?", Number(params.id)))) };
 });
 
-route("DELETE", "/api/trips/(?<id>\\d+)", (req, params) => {
-  const user = currentUser(req);
-  db.prepare("DELETE FROM trips WHERE id = ? AND user_id = ?").run(Number(params.id), user.id);
+route("DELETE", "/api/trips/(?<id>\\d+)", async (req, params) => {
+  const user = await currentUser(req);
+  (await db.run("DELETE FROM trips WHERE id = ? AND user_id = ?", Number(params.id), user.id));
   return [204];
 });
 
@@ -265,4 +267,4 @@ const server = createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, () => console.log(`✦ API WanderMap prête sur http://localhost:${PORT}`));
+server.listen(PORT, () => console.log(`✦ WanderMap prêt sur http://localhost:${PORT}`));

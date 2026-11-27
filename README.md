@@ -4,7 +4,7 @@ Site web de voyage : explorez **tous les pays du monde** sur une **carte interac
 
 ## Lancer le projet
 
-Prérequis : **Node.js 22.13 ou plus récent** (`node -v` pour vérifier). Le serveur utilise la base SQLite intégrée à Node, il n'y a rien d'autre à installer.
+Prérequis : **Node.js 22.13 ou plus récent** (`node -v` pour vérifier). En local, le serveur utilise la base SQLite intégrée à Node.
 
 ```bash
 npm install
@@ -16,20 +16,30 @@ Ouvrez ensuite **http://localhost:5173**.
 
 > Le dossier `node_modules` n'est pas inclus dans le ZIP : `npm install` le recrée (il ajoute aussi les nouvelles bibliothèques `leaflet` et `topojson-client`).
 
-### Mise en ligne (production)
+### Mise en ligne gratuite : Render + Turso
 
-```bash
-npm run build   # compile le site dans dist/
-npm start       # un seul serveur sert le site ET l'API sur le port 3001 (ou $PORT)
-```
+- **Render** fait tourner le site (offre gratuite).
+- **Turso** garde la base de données (offre gratuite). Les comptes ne se perdent donc pas quand Render redémarre.
 
-Hébergeur conseillé : un service qui exécute Node.js avec un **disque persistant** (Render, Railway, Fly.io, un VPS…), car la base SQLite est un fichier. Variables d'environnement utiles :
+Sur Render, créez un « Web Service » relié au dépôt GitHub, avec :
+
+| Réglage | Valeur |
+|---|---|
+| Build Command | `npm install && npm run build` |
+| Start Command | `npm start` |
+| Instance Type | Free |
+
+Variables d'environnement (onglet *Environment*) :
 
 | Variable | Rôle |
 |---|---|
-| `PORT` | Port du serveur (défaut 3001) |
-| `JWT_SECRET` | Clé secrète des sessions (sinon générée automatiquement dans `server/data/.jwt-secret`) |
-| `DATA_DIR` | Dossier de la base de données (défaut `server/data/`) |
+| `TURSO_DATABASE_URL` | Adresse de la base Turso (`libsql://….turso.io`) |
+| `TURSO_AUTH_TOKEN` | Jeton d'accès de la base Turso |
+| `JWT_SECRET` | Longue phrase secrète qui signe les connexions |
+
+Sans `TURSO_DATABASE_URL`, le serveur utilise le fichier local `server/data/wandermap.db` : c'est le mode utilisé sur votre ordinateur.
+
+À savoir : sur l'offre gratuite, Render met le site en pause après 15 minutes sans visite. La visite suivante prend alors environ une minute à charger.
 
 ## Ce qui a changé par rapport à la version 1
 
@@ -69,7 +79,7 @@ WanderMap/
 ├── scripts/dev.mjs          Lance serveur + site avec une seule commande
 ├── server/                  ── BACK-END (Node.js, sans framework) ──
 │   ├── index.js             Serveur HTTP : toutes les routes /api + service du site compilé
-│   ├── db.js                Création de la base SQLite et des 4 tables
+│   ├── db.js                Base de données : Turso en ligne, fichier SQLite en local (4 tables)
 │   └── auth.js              Hachage des mots de passe (scrypt) et jetons de connexion (JWT)
 └── src/                     ── FRONT-END (React) ──
     ├── main.jsx             Point d'entrée React
@@ -108,7 +118,7 @@ WanderMap/
 | `country_status` | pour chaque utilisateur et pays : `visited` ou `wishlist` |
 | `trips` | voyages : nom, pays, dates, notes, étapes (JSON ordonné) |
 
-Supprimer un utilisateur supprime automatiquement ses favoris, pays et voyages (`ON DELETE CASCADE`).
+Supprimer un utilisateur supprime aussi ses favoris, pays et voyages.
 
 ## API du serveur
 
